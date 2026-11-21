@@ -202,7 +202,7 @@ export default function StudioView({ clip, onBack }: Props) {
           setNotice(`Lost the player at ${formatClock(endedAt)}. Place a new halo on them to keep following.`);
         }
         if (stop === 'crowded') {
-          setNotice(`Two people were too close together at ${formatClock(endedAt)}, so tracking stopped. Find them again to continue.`);
+          setNotice(`Could not tell two people apart after ${formatClock(endedAt)}, so tracking stopped. Find them again to continue.`);
         }
       })
       .catch((err: unknown) => setNotice(errorMessage(err)))
