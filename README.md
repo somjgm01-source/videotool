@@ -19,3 +19,7 @@ npm run dev
 ```
 
 Checks: `npm run typecheck`, `npm run lint`, `npm run build`.
+
+## Deploy (Netlify)
+
+`netlify.toml` holds the build settings. In Netlify: **Add new site → Import from Git → this repo**, then add `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` under **Site configuration → Environment variables** and redeploy. In Supabase, set **Authentication → URL Configuration → Site URL** to the Netlify URL so sign-up confirmation links point to the live site.

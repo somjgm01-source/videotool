@@ -1,0 +1,24 @@
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+[build.environment]
+  # Vite 7 needs Node 20.19 or newer.
+  NODE_VERSION = "22"
+
+# Single-page app: serve index.html for any unknown path.
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
+
+# The detection model and MediaPipe wasm are large and never change between deploys of the same name.
+[[headers]]
+  for = "/models/*"
+  [headers.values]
+    Cache-Control = "public, max-age=604800"
+
+[[headers]]
+  for = "/mediapipe/*"
+  [headers.values]
+    Cache-Control = "public, max-age=604800"
