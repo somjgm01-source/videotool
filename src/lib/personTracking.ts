@@ -1,4 +1,5 @@
 import { FilesetResolver, ObjectDetector, type ObjectDetectorResult } from '@mediapipe/tasks-vision';
+import { createMatcher, lookOf, step, predict, type Candidate, type Look } from '@/lib/trackMatcher';
 import { seekVideo } from '@/lib/video';
 import type { Point, TrackPoint } from '@/types';
 
@@ -10,10 +11,9 @@ const MIN_PERSON_SCORE = 0.25;
 const LOCATE_SHARE = 0.4;
 const TRACK_HEIGHTS = 9;
 const MIN_TRACK_SIDE = 320;
-const MATCH_HEIGHTS = 0.6;
-const MAX_MISSES = 2;
 
 export type Box = Point & { w: number; h: number };
+export type Detection = Candidate;
 export type PersonSample = TrackPoint & { w: number; h: number };
 export type TrackStop = 'finished' | 'lost' | 'crowded' | 'cancelled';
 export type TrackResult = { track: TrackPoint[]; endedAt: number; stop: TrackStop };
@@ -72,12 +72,20 @@ function detectInRegion(
   canvas: HTMLCanvasElement,
   ctx: CanvasRenderingContext2D,
   region: Region,
-): Box[] {
+): Detection[] {
   ctx.drawImage(video, region.x, region.y, region.side, region.side, 0, 0, DETECT_SIZE, DETECT_SIZE);
-  return toBoxes(detector.detect(canvas), region, video.videoWidth, video.videoHeight);
+  const result = detector.detect(canvas);
+  const pixels = ctx.getImageData(0, 0, DETECT_SIZE, DETECT_SIZE).data;
+  return toDetections(result, pixels, region, video.videoWidth, video.videoHeight);
 }
 
-function toBoxes(result: ObjectDetectorResult, region: Region, frameWidth: number, frameHeight: number): Box[] {
+function toDetections(
+  result: ObjectDetectorResult,
+  pixels: Uint8ClampedArray,
+  region: Region,
+  frameWidth: number,
+  frameHeight: number,
+): Detection[] {
   const scale = region.side / DETECT_SIZE;
   return result.detections.flatMap((detection) => {
     const box = detection.boundingBox;
@@ -90,6 +98,7 @@ function toBoxes(result: ObjectDetectorResult, region: Region, frameWidth: numbe
         y: centreY / frameHeight,
         w: (box.width * scale) / frameWidth,
         h: (box.height * scale) / frameHeight,
+        look: lookOf(pixels, DETECT_SIZE, box),
       },
     ];
   });
@@ -100,8 +109,8 @@ function distanceInHeights(a: Point, b: Point, aspect: number): number {
   return Math.hypot((a.x - b.x) * aspect, a.y - b.y);
 }
 
-function personAt(boxes: Box[], point: Point, aspect: number): Box | null {
-  let best: Box | null = null;
+function personAt<T extends Box>(boxes: T[], point: Point, aspect: number): T | null {
+  let best: T | null = null;
   let bestDistance = Infinity;
   for (const box of boxes) {
     const inside = Math.abs(point.x - box.x) <= box.w / 2 && Math.abs(point.y - box.y) <= box.h / 2;
@@ -126,7 +135,9 @@ export async function detectPersonAt(video: HTMLVideoElement, point: Point): Pro
   const { canvas, ctx } = createSurface();
   const side = Math.round(LOCATE_SHARE * Math.min(width, height));
   const region = regionAround({ x: point.x * width, y: point.y * height }, side, width, height);
-  return personAt(detectInRegion(detector, video, canvas, ctx, region), point, width / height);
+  const person = personAt(detectInRegion(detector, video, canvas, ctx, region), point, width / height);
+  if (!person) return null;
+  return { x: person.x, y: person.y, w: person.w, h: person.h };
 }
 
 export async function trackPerson(
@@ -144,39 +155,44 @@ export async function trackPerson(
     const { canvas, ctx } = createSurface();
     const span = Math.max(video.duration - start.t, 0);
     const track: TrackPoint[] = [start];
-    let previous: PersonSample = start;
-    let misses = 0;
-    let firstMissAt = start.t;
+    const state = createMatcher(start, await lookAt(video, detector, canvas, ctx, start, width, height));
 
     for (let t = start.t + SAMPLE_SECONDS; t <= video.duration; t += SAMPLE_SECONDS) {
-      if (signal.aborted) return { track, endedAt: previous.t, stop: 'cancelled' };
+      if (signal.aborted) return { track, endedAt: state.last.t, stop: 'cancelled' };
       await seekVideo(video, t);
-      const side = Math.min(shortSide, Math.max(MIN_TRACK_SIDE, Math.round(TRACK_HEIGHTS * previous.h * height)));
-      const region = regionAround({ x: previous.x * width, y: previous.y * height }, side, width, height);
-      const candidates = detectInRegion(detector, video, canvas, ctx, region).filter(
-        (box) => distanceInHeights(box, previous, aspect) <= MATCH_HEIGHTS * previous.h,
-      );
+      const centre = predict(state, t, aspect);
+      const side = Math.min(shortSide, Math.max(MIN_TRACK_SIDE, Math.round(TRACK_HEIGHTS * state.last.h * height)));
+      const region = regionAround({ x: centre.x * width, y: centre.y * height }, side, width, height);
+      const outcome = step(state, t, detectInRegion(detector, video, canvas, ctx, region), aspect);
 
-      if (candidates.length > 1) return { track, endedAt: t, stop: 'crowded' };
-      if (candidates.length === 0) {
-        if (misses === 0) firstMissAt = t;
-        misses++;
-        if (misses >= MAX_MISSES) return { track, endedAt: firstMissAt, stop: 'lost' };
-      } else {
-        misses = 0;
-        const [box] = candidates;
-        previous = { t, x: box.x, y: box.y, w: box.w, h: box.h };
-        track.push(previous);
-      }
+      if (outcome.kind === 'lost') return { track, endedAt: state.last.t, stop: 'lost' };
+      if (outcome.kind === 'crowded') return { track, endedAt: state.last.t, stop: 'crowded' };
+      if (outcome.kind === 'match') track.push({ ...outcome.sample });
       onProgress(span > 0 ? (t - start.t) / span : 1, track.slice());
     }
 
     onProgress(1, track);
-    return { track, endedAt: previous.t, stop: 'finished' };
+    return { track, endedAt: state.last.t, stop: 'finished' };
   } finally {
     video.removeAttribute('src');
     video.load();
   }
+}
+
+// Colours of the clicked person in the starting frame, used to tell them apart from others later.
+async function lookAt(
+  video: HTMLVideoElement,
+  detector: ObjectDetector,
+  canvas: HTMLCanvasElement,
+  ctx: CanvasRenderingContext2D,
+  start: PersonSample,
+  width: number,
+  height: number,
+): Promise<Look | null> {
+  await seekVideo(video, start.t);
+  const side = Math.min(Math.min(width, height), Math.max(MIN_TRACK_SIDE, Math.round(TRACK_HEIGHTS * start.h * height)));
+  const region = regionAround({ x: start.x * width, y: start.y * height }, side, width, height);
+  return personAt(detectInRegion(detector, video, canvas, ctx, region), start, width / height)?.look ?? null;
 }
 
 function openVideo(src: string): Promise<HTMLVideoElement> {
